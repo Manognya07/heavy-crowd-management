@@ -1,0 +1,1 @@
+Live Monitoring & Alerts – Uses cameras, sensors, and AI to track crowd density, movement, and flow in real time, sending instant alerts to prevent overcrowding or unsafe conditions.
