@@ -2,7 +2,7 @@
 // Run: npm init -y && npm i express ws body-parser
 // Then: node server.js
 
-const express = require('express');
+
 const http = require('http');
 const WebSocket = require('ws');
 const bodyParser = require('body-parser');
@@ -238,3 +238,4 @@ Requires internet for CDN assets (maplibre). If you want offline, vendor the lib
 </script>
 </body>
 </html>
+
