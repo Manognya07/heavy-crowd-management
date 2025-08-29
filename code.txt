@@ -1,0 +1,240 @@
+// === FILE: server.js ===
+// Run: npm init -y && npm i express ws body-parser
+// Then: node server.js
+
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+const bodyParser = require('body-parser');
+const path = require('path');
+
+const app = express();
+app.use(bodyParser.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Simple ingestion endpoint for real edge devices
+app.post('/ingest/tile', (req, res) => {
+  // Expected JSON: { venueId, tileId, t, density, speed, dir:[x,y], conf }
+  const payload = req.body;
+  // Broadcast to connected WS clients
+  broadcast(JSON.stringify({ type: 'tile', data: payload }));
+  res.json({ ok: true });
+});
+
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: '/ws' });
+
+let clients = new Set();
+
+wss.on('connection', (ws) => {
+  clients.add(ws);
+  console.log('WS client connected, total=', clients.size);
+  ws.on('close', () => { clients.delete(ws); console.log('client left', clients.size); });
+});
+
+function broadcast(msg) {
+  for (const c of clients) {
+    if (c.readyState === WebSocket.OPEN) c.send(msg);
+  }
+}
+
+// --- Simple in-memory simulated tile state ---
+const TILE_GRID_W = 20; // columns
+const TILE_GRID_H = 12; // rows
+const TILE_SIZE_M = 10; // meters (for density calc)
+let tiles = [];
+for (let y = 0; y < TILE_GRID_H; y++) {
+  for (let x = 0; x < TILE_GRID_W; x++) {
+    const id = `t_${x}_${y}`;
+    tiles.push({ id, x, y, density: Math.random()*0.5, speed: 1.2 + Math.random()*0.8, dir:[Math.random()*2-1, Math.random()*2-1] });
+  }
+}
+
+function computeFriction(density, speed, headingVar) {
+  // simple friction index in 0..1
+  // assume density in ppl/m^2, speed in m/s
+  const dNorm = Math.tanh(density*2.0); // saturate
+  const sNorm = Math.min(Math.max((speed / 1.5), 0), 2); // around typical walking speed
+  const friction = 0.6*dNorm + 0.35*(1 - Math.tanh(sNorm)) + 0.05*Math.min(headingVar,1);
+  return Math.max(0, Math.min(1, friction));
+}
+
+function headingVariance(sample) {
+  // sample: array of heading angles in radians
+  if (!sample || sample.length === 0) return 0;
+  const meanX = sample.reduce((a,b)=>a+Math.cos(b),0)/sample.length;
+  const meanY = sample.reduce((a,b)=>a+Math.sin(b),0)/sample.length;
+  const R = Math.sqrt(meanX*meanX + meanY*meanY);
+  return 1 - R; // von Mises concentration -> variance-like
+}
+
+// Periodically update simulated tiles and broadcast
+setInterval(() => {
+  // random events: occasionally create a bottleneck by reducing speed in a column
+  const event = Math.random() < 0.07;
+  const bottleneckX = event ? Math.floor(Math.random()*TILE_GRID_W) : -1;
+
+  const packets = [];
+  tiles.forEach(tile => {
+    // random walk density
+    tile.density += (Math.random()-0.5)*0.05; // small noise
+    tile.density = Math.max(0, tile.density);
+
+    // speed influenced by density and events
+    let speed = 1.4 - tile.density*0.9 + (Math.random()-0.5)*0.2;
+    if (tile.x === bottleneckX) speed *= 0.25 + Math.random()*0.5; // bottleneck slows
+    speed = Math.max(0.1, speed);
+
+    // direction wobble
+    tile.dir[0] += (Math.random()-0.5)*0.2;
+    tile.dir[1] += (Math.random()-0.5)*0.2;
+    const mag = Math.hypot(tile.dir[0], tile.dir[1]) || 1;
+    tile.dir[0] /= mag; tile.dir[1] /= mag;
+
+    // heading variance estimated from noise
+    const headingSamples = Array.from({length:5}, ()=>Math.atan2(tile.dir[1]+(Math.random()-0.5)*0.4, tile.dir[0]+(Math.random()-0.5)*0.4));
+    const hVar = headingVariance(headingSamples);
+
+    const friction = computeFriction(tile.density, speed, hVar);
+
+    const lng = 78.4867 + (tile.x - TILE_GRID_W/2) * 0.0005;
+    const lat = 17.3850 + (tile.y - TILE_GRID_H/2) * 0.00045;
+
+    const p = { t: new Date().toISOString(), tileId: tile.id, x: tile.x, y: tile.y, density: +(tile.density.toFixed(3)), speed: +(speed.toFixed(3)), dir: [+(tile.dir[0].toFixed(3)), +(tile.dir[1].toFixed(3))], friction: +(friction.toFixed(3)), lng, lat };
+    packets.push(p);
+  });
+
+  // broadcast an update packet
+  broadcast(JSON.stringify({ type: 'tiles_batch', data: packets }));
+}, 1000);
+
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => console.log(`HTTP+WS server running on http://localhost:${PORT}`));
+
+
+/*
+Folder structure expected:
+- server.js
+- public/
+   - index.html
+   - app.js (optional)
+
+This scaffold serves a small front-end (MapLibre) and a websocket on /ws that emits JSON packets.
+You can also POST real tile JSON to /ingest/tile to inject sensor data.
+*/
+
+
+// === FILE: public/index.html ===
+
+/*
+Save this file to public/index.html. It connects to ws://HOST/ws and renders a heatmap + arrows.
+Requires internet for CDN assets (maplibre). If you want offline, vendor the libs locally.
+*/
+
+/* index.html content starts below */
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CrowdFlow - Live</title>
+  <style>
+    body, html, #map { margin:0; padding:0; height:100%; width:100%; }
+    #sidebar { position:absolute; right:12px; top:12px; z-index:10; background:white; padding:8px;border-radius:6px; box-shadow:0 4px 12px rgba(0,0,0,0.15); font-family:Arial, sans-serif; }
+    .tile-info { font-size:13px }
+  </style>
+  <link href="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.css" rel="stylesheet" />
+</head>
+<body>
+<div id="map"></div>
+<div id="sidebar">Status: <span id="status">connecting...</span><div class="tile-info" id="info"></div></div>
+
+<script src="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.js"></script>
+<script>
+  const statusEl = document.getElementById('status');
+  const infoEl = document.getElementById('info');
+
+  const map = new maplibregl.Map({
+    container: 'map',
+    style: 'https://demotiles.maplibre.org/style.json',
+    center: [78.4867, 17.3850],
+    zoom: 16
+  });
+
+  let sourceId = 'tiles';
+  let features = [];
+
+  map.on('load', ()=>{
+    map.addSource(sourceId, { type: 'geojson', data: { type:'FeatureCollection', features: [] } });
+
+    map.addLayer({ id: 'heat', type: 'heatmap', source: sourceId,
+      paint: {
+        'heatmap-weight': ['get','friction'],
+        'heatmap-radius': ['interpolate',['linear'],['zoom'], 12, 10, 18, 40],
+        'heatmap-opacity': 0.85
+      }
+    });
+
+    map.addLayer({ id: 'arrows', type: 'symbol', source: sourceId,
+      layout: {
+        'icon-image': 'triangle-11',
+        'icon-allow-overlap': true,
+        'icon-size': 0.9,
+        'icon-rotate': ['get','bearing']
+      }
+    });
+
+    // also show circles for strong friction
+    map.addLayer({ id: 'dots', type: 'circle', source: sourceId,
+      paint: {
+        'circle-radius': ['interpolate',['linear'],['get','friction'], 0, 4, 1, 14],
+        'circle-opacity': 0.9
+      }
+    });
+
+  });
+
+  const WS_URL = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws';
+  const ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => { statusEl.textContent = 'connected'; };
+  ws.onclose = () => { statusEl.textContent = 'disconnected'; };
+  ws.onerror = (e) => { statusEl.textContent = 'error'; console.error(e); };
+
+  function packToFeature(p) {
+    const bearing = Math.atan2(p.dir[1], p.dir[0]) * 180/Math.PI;
+    return {
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [p.lng, p.lat] },
+      properties: { friction: p.friction, density: p.density, speed: p.speed, bearing }
+    };
+  }
+
+  ws.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'tiles_batch') {
+        features = msg.data.map(packToFeature);
+        const geo = { type:'FeatureCollection', features };
+        const src = map.getSource(sourceId);
+        if (src) src.setData(geo);
+
+        // show top 3 friction tiles
+        const top = msg.data.slice().sort((a,b)=>b.friction - a.friction).slice(0,3);
+        infoEl.innerHTML = top.map(t=>`<div><b>${t.tileId}</b> fr=${t.friction} d=${t.density} s=${t.speed}</div>`).join('');
+      } else if (msg.type === 'tile') {
+        // single tile injection
+        const feature = packToFeature(msg.data);
+        // replace or push
+        const idx = features.findIndex(f=>f.properties && f.properties.tileId === msg.data.tileId);
+        // keep simple: just push and refresh source
+        features.push(feature);
+        const src = map.getSource(sourceId);
+        if (src) src.setData({ type:'FeatureCollection', features });
+      }
+    } catch(err) { console.error('ws parse', err); }
+  };
+</script>
+</body>
+</html>
